@@ -17,9 +17,9 @@ Python 3.7+
 If the python package is hosted on a repository, you can install directly using:
 
 ```sh
-pip install git+https://github.com/treeverse/lakeFS.git
+pip install "git+https://github.com/treeverse/lakeFS.git#subdirectory=clients/python"
 ```
-(you may need to run `pip` with root permission: `sudo pip install git+https://github.com/treeverse/lakeFS.git`)
+(you may need to run `pip` with root permission: `sudo pip install "git+https://github.com/treeverse/lakeFS.git#subdirectory=clients/python"`)
 
 Then import the package:
 ```python
@@ -53,12 +53,15 @@ Please follow the [installation procedure](#installation--usage) and then run th
 import time
 import lakefs_sdk
 from lakefs_sdk.rest import ApiException
+from lakefs_sdk.api import branches_api
 from pprint import pprint
 
 # Defining the host is optional and defaults to /api/v1
 # See configuration.py for a list of all supported configuration parameters.
 configuration = lakefs_sdk.Configuration(
-    host = "/api/v1"
+    host = "",
+    username = "",
+    password = ""
 )
 
 # The client must configure the authentication and authorization parameters
@@ -99,14 +102,11 @@ configuration = lakefs_sdk.Configuration(
 # Enter a context with an instance of the API client
 with lakefs_sdk.ApiClient(configuration) as api_client:
     # Create an instance of the API class
-    api_instance = lakefs_sdk.ActionsApi(api_client)
-    repository = 'repository_example' # str | 
-    run_id = 'run_id_example' # str | 
-
+    api_instance = branches_api.BranchesApi(api_client)
+    repository = 'paper'
     try:
         # get a run
-        api_response = api_instance.get_run(repository, run_id)
-        print("The response of ActionsApi->get_run:\n")
+        api_response = api_instance.list_branches(repository)
         pprint(api_response)
     except ApiException as e:
         print("Exception when calling ActionsApi->get_run: %s\n" % e)

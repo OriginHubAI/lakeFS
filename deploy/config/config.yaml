@@ -1,0 +1,61 @@
+# ============================================
+# lakeFS 配置文件
+# ============================================
+
+# ----------------
+# 元数据存储配置 (PostgreSQL)
+# ----------------
+database:
+  type: postgres
+  postgres:
+    connection_string: "postgres://lakefs:lakefs123@postgres:5432/lakefs?sslmode=disable"
+    max_open_connections: 25
+    max_idle_connections: 25
+    connection_max_lifetime: 5m
+
+# ----------------
+# 认证与访问控制
+# ----------------
+auth:
+  encrypt:
+    # 重要：此密钥用于加密敏感数据，生产环境请通过环境变量覆盖
+    # 环境变量: LAKEFS_AUTH_ENCRYPT_SECRET_KEY
+    secret_key: "your-production-secret-key-32ch"
+  ui_config:
+    # RBAC 模式:
+    #   none       - 使用内置认证服务（推荐单机/简单部署）
+    #   simplified - 需要外部 Auth API 服务
+    #   internal   - 需要外部 Auth API 服务（高级权限控制）
+    #   external   - 需要外部 Auth API 服务（高级权限控制）
+    rbac: none
+  cache:
+    enabled: true
+    size: 1024
+    ttl: 20s
+    jitter: 3s
+
+# ----------------
+# 对象存储配置 (MinIO/S3)
+# ----------------
+blockstore:
+  type: s3
+  s3:
+    force_path_style: true
+    endpoint: http://minio:9000
+    discover_bucket_region: false
+    credentials:
+      access_key_id: minioadmin
+      secret_access_key: minioadmin
+
+# ----------------
+# 日志配置
+# ----------------
+logging:
+  format: json
+  level: info
+  audit_log_level: info
+
+# ----------------
+# 服务监听地址
+# ----------------
+listen_address: "0.0.0.0:8000"

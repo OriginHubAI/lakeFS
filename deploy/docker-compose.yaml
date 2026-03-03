@@ -1,0 +1,65 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: origin-hub-ai-registry.cn-shanghai.cr.aliyuncs.com/dataflow/postgres:16
+    container_name: lakefs-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-lakefs}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-lakefs123}
+      POSTGRES_DB: ${POSTGRES_DB:-lakefs}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-lakefs} -d ${POSTGRES_DB:-lakefs}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  minio:
+    image: origin-hub-ai-registry.cn-shanghai.cr.aliyuncs.com/dataflow/minio:RELEASE.2024-10-29T16-01-48Z
+    container_name: lakefs-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  lakefs:
+    image: origin-hub-ai-registry.cn-shanghai.cr.aliyuncs.com/dataflow/lakefs:1.0.0
+    container_name: lakefs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    ports:
+      - "${LAKEFS_PORT:-8000}:8000"
+    volumes:
+      - ./config/config.yaml:/etc/lakefs/config.yaml:ro
+    command: ["run", "--config", "/etc/lakefs/config.yaml"]
+    environment:
+      - LAKEFS_AUTH_ENCRYPT_SECRET_KEY=${LAKEFS_AUTH_ENCRYPT_SECRET_KEY:-your-production-secret-key-32ch}
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8000/api/v1/healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  minio_data:
