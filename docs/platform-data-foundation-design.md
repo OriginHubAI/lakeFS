@@ -51,17 +51,17 @@
 │  Dataset   │    File      │   Version    │     Lineage          │
 │  Service   │   Service    │   Service    │     Service          │
 ├────────────┴──────────────┴──────────────┴──────────────────────┤
-│                    Platform Service Layer                        │
-│          (业务逻辑封装、自动版本管理、权限控制)                     │
+│                    Platform Service Layer                       │
+│          (业务逻辑封装、自动版本管理、权限控制)                       │
 ├─────────────────────────────────────┬──────────────────────────-┤
 │         lakeFS SDK / API            │     Lineage Store         │
-│   (Repository, Object, Commit,     │   (PostgreSQL / KV)       │
+│   (Repository, Object, Commit,      │   (PostgreSQL / KV)       │
 │    Branch, Tag, Diff, Merge)        │                           │
 ├─────────────────────────────────────┤                           │
 │            lakeFS Server            │                           │
 │  ┌──────────┬──────────┬─────────┐  │                           │
 │  │ Catalog  │ Graveler │  Auth   │  │                           │
-│  │ (对象管理)│(版本引擎) │(认证授权)│  │                           │
+│  │ (对象管理)│(版本引擎) │(认证授权) │  │                           │
 │  ├──────────┴──────────┴─────────┤  │                           │
 │  │     KV Store (PostgreSQL)     │  │                           │
 │  │     Block Storage (S3/MinIO)  │  │                           │
@@ -916,92 +916,1532 @@ hooks:
 
 ### 5.1 技术栈
 
-| 组件 | 技术选型 | 说明 |
-|------|---------|------|
-| Platform API | Go (chi router) | 与 lakeFS 技术栈一致，可直接复用代码 |
-| lakeFS 集成 | lakeFS Go SDK / REST API | 直接调用 lakeFS 的 Go catalog 包或 REST API |
-| Lineage 存储 | PostgreSQL | 复用 lakeFS 的 PostgreSQL 实例 |
-| 缓存 | 本地缓存 (go-cache / ristretto) | 缓存数据集属性、大小等频繁查询的数据 |
-| API 文档 | OpenAPI 3.0 | 与 lakeFS 保持一致 |
+| 组件 | 技术选型 | 版本 | 说明 |
+|------|---------|------|------|
+| Web 框架 | FastAPI | >=0.110 | 高性能异步框架，自带 OpenAPI 文档生成 |
+| lakeFS 集成 | lakefs-sdk (官方 Python SDK) | >=1.0 | lakeFS 官方 Python 客户端 |
+| ORM | SQLAlchemy | >=2.0 | Lineage 元数据持久化，支持异步 |
+| 数据库迁移 | Alembic | >=1.13 | 数据库 Schema 版本管理 |
+| Lineage 存储 | PostgreSQL | >=14 | 复用 lakeFS 的 PostgreSQL 实例 |
+| 数据校验 | Pydantic | >=2.0 | 请求/响应模型校验（FastAPI 内置集成） |
+| 异步 HTTP | httpx | >=0.27 | 异步调用 lakeFS REST API（SDK 不支持的场景） |
+| 缓存 | cachetools | >=5.3 | 内存缓存（数据集大小等高频查询） |
+| 任务调度 | APScheduler | >=3.10 | 异步校准任务（数据集大小定时重算） |
+| 测试 | pytest + pytest-asyncio | - | 单元测试和集成测试 |
+| 容器化 | Docker + docker-compose | - | 开发与部署 |
+| 代码质量 | ruff + mypy | - | Lint + 类型检查 |
 
-### 5.2 部署方式
-
-#### 方式一：独立服务（推荐一期）
+### 5.2 部署架构
 
 ```
-┌─────────────┐    REST API    ┌──────────────┐    REST API    ┌──────────┐
-│   Client    │───────────────>│  Platform    │───────────────>│  lakeFS  │
-│  (SDK/CLI)  │                │  Service     │                │  Server  │
-└─────────────┘                └──────┬───────┘                └────┬─────┘
-                                      │                             │
-                                      │ SQL                         │ KV + Block
-                                      ▼                             ▼
-                               ┌──────────────┐             ┌──────────────┐
-                               │ PostgreSQL   │             │ PostgreSQL   │
-                               │ (lineage)    │             │ (lakeFS KV)  │
-                               └──────────────┘             │ S3/MinIO     │
-                                                            └──────────────┘
+┌─────────────────┐   HTTP/SDK   ┌────────────────────┐  lakefs-sdk  ┌──────────┐
+│  Python Client  │─────────────>│  Platform Service  │─────────────>│  lakeFS  │
+│  (SDK/Notebook)  │              │  (FastAPI + Uvicorn)│              │  Server  │
+└─────────────────┘              └────────┬───────────┘              └────┬─────┘
+                                          │                               │
+                                          │ SQLAlchemy (async)            │ KV + Block
+                                          ▼                               ▼
+                                   ┌──────────────┐               ┌──────────────┐
+                                   │ PostgreSQL   │               │ PostgreSQL   │
+                                   │ (lineage DB) │               │ (lakeFS KV)  │
+                                   └──────────────┘               │ S3/MinIO     │
+                                                                  └──────────────┘
 ```
 
-优点：与 lakeFS 解耦，独立开发部署，不影响 lakeFS 稳定性。
-
-#### 方式二：lakeFS 插件（后续考虑）
-
-将 Platform Service 的逻辑作为 lakeFS 的内置模块，直接调用 Go 层面的 catalog 包，减少网络开销。适合长期演进。
+Platform Service 作为独立 Python 服务部署，通过 `lakefs-sdk` 调用 lakeFS API，Lineage 数据存储在独立的 PostgreSQL schema 中。
 
 ### 5.3 项目结构
 
 ```
 platform-data-service/
-├── cmd/
-│   └── server/
-│       └── main.go                 # 服务入口
-├── api/
-│   └── swagger.yml                 # OpenAPI 定义
-├── pkg/
-│   ├── api/
-│   │   ├── handler_dataset.go      # 数据集 API handler
-│   │   ├── handler_file.go         # 文件操作 API handler
-│   │   ├── handler_version.go      # 版本管理 API handler
-│   │   └── handler_lineage.go      # Lineage API handler
-│   ├── service/
-│   │   ├── dataset.go              # 数据集业务逻辑
-│   │   ├── file.go                 # 文件操作业务逻辑
-│   │   ├── version.go              # 版本管理业务逻辑
-│   │   └── lineage.go              # Lineage 业务逻辑
-│   ├── lakefs/
-│   │   └── client.go               # lakeFS API 客户端封装
-│   ├── lineage/
-│   │   ├── store.go                # Lineage 数据存储
-│   │   └── dag.go                  # DAG 构建与查询
-│   ├── model/
-│   │   ├── dataset.go              # 数据模型定义
-│   │   ├── version.go
-│   │   └── lineage.go
-│   └── config/
-│       └── config.go               # 配置管理
-├── migrations/
-│   └── 001_create_lineage_tables.sql
-├── deploy/
-│   └── docker-compose.yml
-├── go.mod
-└── go.sum
+├── pyproject.toml                      # 项目元数据 & 依赖管理 (PEP 621)
+├── alembic.ini                         # Alembic 迁移配置
+├── Dockerfile
+├── docker-compose.yml                  # 本地开发：lakeFS + PostgreSQL + MinIO + 本服务
+├── .env.example                        # 环境变量示例
+│
+├── migrations/                         # Alembic 数据库迁移
+│   ├── env.py
+│   └── versions/
+│       └── 001_create_lineage_tables.py
+│
+├── src/
+│   └── platform_data_service/          # 主 Python 包
+│       ├── __init__.py
+│       ├── main.py                     # FastAPI app 创建 & 启动入口
+│       ├── config.py                   # 配置管理 (pydantic-settings)
+│       ├── dependencies.py             # FastAPI 依赖注入 (DB session, lakeFS client 等)
+│       │
+│       ├── models/                     # Pydantic 模型 (API schema)
+│       │   ├── __init__.py
+│       │   ├── dataset.py              # DatasetCreate, DatasetResponse, DatasetUpdate ...
+│       │   ├── file.py                 # FileUploadResponse, FileInfo, FileListResponse ...
+│       │   ├── version.py              # VersionInfo, VersionDetail, RollbackRequest ...
+│       │   ├── lineage.py              # TaskCreate, TaskRunResponse, LineageEdge, DAGResponse ...
+│       │   └── common.py               # PaginatedResponse, ErrorResponse ...
+│       │
+│       ├── db/                         # 数据库层 (Lineage 持久化)
+│       │   ├── __init__.py
+│       │   ├── engine.py               # SQLAlchemy async engine & session factory
+│       │   ├── tables.py               # SQLAlchemy Table 定义 (lineage_tasks, lineage_task_runs, lineage_edges)
+│       │   └── repository.py           # 数据访问层 (CRUD for lineage tables)
+│       │
+│       ├── lakefs/                     # lakeFS 客户端封装层
+│       │   ├── __init__.py
+│       │   ├── client.py               # LakeFSClient: 封装 lakefs-sdk，提供高层操作
+│       │   └── errors.py               # lakeFS 异常映射为平台异常
+│       │
+│       ├── services/                   # 业务逻辑层
+│       │   ├── __init__.py
+│       │   ├── dataset_service.py      # DatasetService: 数据集 CRUD + 属性聚合
+│       │   ├── file_service.py         # FileService: 文件操作 + 自动 commit
+│       │   ├── version_service.py      # VersionService: 版本列表、详情、回滚
+│       │   └── lineage_service.py      # LineageService: 任务管理、血缘记录、DAG 查询
+│       │
+│       ├── routers/                    # FastAPI 路由层
+│       │   ├── __init__.py
+│       │   ├── datasets.py             # /api/v1/datasets/...
+│       │   ├── files.py                # /api/v1/datasets/{id}/files/...
+│       │   ├── versions.py             # /api/v1/datasets/{id}/versions/...
+│       │   └── lineage.py              # /api/v1/lineage/...
+│       │
+│       ├── tasks/                      # 后台任务
+│       │   ├── __init__.py
+│       │   └── size_calibration.py     # 数据集大小异步校准定时任务
+│       │
+│       └── exceptions.py               # 全局异常定义 & FastAPI exception handler
+│
+├── tests/
+│   ├── conftest.py                     # pytest fixtures (test DB, mock lakeFS)
+│   ├── unit/
+│   │   ├── test_dataset_service.py
+│   │   ├── test_file_service.py
+│   │   ├── test_version_service.py
+│   │   └── test_lineage_service.py
+│   └── integration/
+│       ├── test_dataset_api.py
+│       ├── test_file_api.py
+│       ├── test_version_api.py
+│       └── test_lineage_api.py
+│
+└── sdk/                                # Python SDK (供外部用户使用)
+    ├── pyproject.toml
+    └── src/
+        └── platform_data_sdk/
+            ├── __init__.py
+            ├── client.py               # PlatformClient 主入口
+            ├── models.py               # SDK 数据模型
+            └── exceptions.py           # SDK 异常
 ```
 
-## 6. Python SDK 设计
+## 6. Python 实现框架详细设计
 
-为用户提供 Python SDK，方便在数据处理脚本和 Notebook 中使用：
+本节详细说明 Python 实现框架的核心模块设计，包括关键类、接口定义和模块间交互方式。
+
+### 6.1 配置管理 (`config.py`)
+
+使用 `pydantic-settings` 管理配置，支持环境变量和 `.env` 文件：
+
+```python
+from pydantic_settings import BaseSettings
+
+class Settings(BaseSettings):
+    model_config = {"env_prefix": "PLATFORM_"}
+
+    # FastAPI
+    app_title: str = "Platform Data Service"
+    debug: bool = False
+    host: str = "0.0.0.0"
+    port: int = 8080
+
+    # lakeFS
+    lakefs_endpoint: str = "http://localhost:8000"
+    lakefs_access_key: str = ""
+    lakefs_secret_key: str = ""
+    lakefs_default_branch: str = "main"
+    lakefs_storage_namespace_prefix: str = "s3://platform-data"
+
+    # PostgreSQL (Lineage)
+    database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/platform_lineage"
+
+    # 缓存
+    cache_ttl_seconds: int = 300
+    size_calibration_interval_minutes: int = 60
+```
+
+### 6.2 lakeFS 客户端封装层 (`lakefs/client.py`)
+
+封装 `lakefs-sdk`，将 lakeFS 底层操作抽象为平台语义：
+
+```python
+import lakefs_sdk
+from lakefs_sdk.client import LakeFSClient as _SDKClient
+
+class LakeFSClient:
+    """封装 lakefs-sdk，对外提供数据集/文件/版本语义的操作接口。"""
+
+    METADATA_PREFIX = "platform."
+
+    def __init__(self, endpoint: str, access_key: str, secret_key: str):
+        configuration = lakefs_sdk.Configuration(
+            host=endpoint,
+            username=access_key,
+            password=secret_key,
+        )
+        self._client = _SDKClient(configuration)
+
+    # ---- Repository (Dataset) 操作 ----
+
+    def create_repository(
+        self, name: str, storage_namespace: str, default_branch: str = "main"
+    ) -> lakefs_sdk.Repository:
+        return self._client.repositories_api.create_repository(
+            repository_creation=lakefs_sdk.RepositoryCreation(
+                name=name,
+                storage_namespace=storage_namespace,
+                default_branch=default_branch,
+            )
+        )
+
+    def delete_repository(self, name: str) -> None:
+        self._client.repositories_api.delete_repository(name)
+
+    def get_repository(self, name: str) -> lakefs_sdk.Repository:
+        return self._client.repositories_api.get_repository(name)
+
+    def list_repositories(
+        self, prefix: str = "", after: str = "", amount: int = 100
+    ) -> lakefs_sdk.RepositoryList:
+        return self._client.repositories_api.list_repositories(
+            prefix=prefix, after=after, amount=amount
+        )
+
+    def set_repository_metadata(self, repo: str, metadata: dict[str, str]) -> None:
+        self._client.internal_api.set_repository_metadata(
+            repo, lakefs_sdk.RepositoryMetadataSet(metadata=metadata)
+        )
+
+    def get_repository_metadata(self, repo: str) -> dict[str, str]:
+        resp = self._client.internal_api.get_repository_metadata(repo)
+        return resp.metadata or {}
+
+    # ---- Object (File) 操作 ----
+
+    def upload_object(
+        self, repo: str, branch: str, path: str, content: bytes | str,
+    ) -> lakefs_sdk.ObjectStats:
+        return self._client.objects_api.upload_object(
+            repository=repo, branch=branch, path=path, content=content,
+        )
+
+    def delete_object(self, repo: str, branch: str, path: str) -> None:
+        self._client.objects_api.delete_object(
+            repository=repo, branch=branch, path=path,
+        )
+
+    def get_object(self, repo: str, ref: str, path: str) -> bytes:
+        return self._client.objects_api.get_object(
+            repository=repo, ref=ref, path=path,
+        )
+
+    def stat_object(self, repo: str, ref: str, path: str) -> lakefs_sdk.ObjectStats:
+        return self._client.objects_api.stat_object(
+            repository=repo, ref=ref, path=path,
+        )
+
+    def list_objects(
+        self, repo: str, ref: str, prefix: str = "",
+        after: str = "", amount: int = 100, delimiter: str = "",
+    ) -> lakefs_sdk.ObjectStatsList:
+        return self._client.objects_api.list_objects(
+            repository=repo, ref=ref, prefix=prefix,
+            after=after, amount=amount, delimiter=delimiter,
+        )
+
+    # ---- Commit (Version) 操作 ----
+
+    def commit(
+        self, repo: str, branch: str, message: str, metadata: dict[str, str] | None = None,
+    ) -> lakefs_sdk.Commit:
+        return self._client.commits_api.commit(
+            repository=repo, branch=branch,
+            commit_creation=lakefs_sdk.CommitCreation(
+                message=message, metadata=metadata or {},
+            ),
+        )
+
+    def get_commit(self, repo: str, commit_id: str) -> lakefs_sdk.Commit:
+        return self._client.commits_api.get_commit(
+            repository=repo, commit_id=commit_id,
+        )
+
+    def log_commits(
+        self, repo: str, ref: str, after: str = "", amount: int = 100,
+    ) -> lakefs_sdk.CommitList:
+        return self._client.refs_api.log_commits(
+            repository=repo, ref=ref, after=after, amount=amount,
+        )
+
+    # ---- Diff & Revert ----
+
+    def diff_refs(
+        self, repo: str, left_ref: str, right_ref: str,
+        after: str = "", amount: int = 100,
+    ) -> lakefs_sdk.DiffList:
+        return self._client.refs_api.diff_refs(
+            repository=repo, left_ref=left_ref, right_ref=right_ref,
+            after=after, amount=amount,
+        )
+
+    def revert_commit(
+        self, repo: str, branch: str, ref: str, parent_number: int = 0,
+    ) -> None:
+        self._client.branches_api.revert_branch(
+            repository=repo, branch=branch,
+            revert_creation=lakefs_sdk.RevertCreation(
+                ref=ref, parent_number=parent_number,
+            ),
+        )
+
+    def hard_reset_branch(self, repo: str, branch: str, ref: str) -> None:
+        self._client.branches_api.hard_reset_branch(
+            repository=repo, branch=branch, ref=ref,
+        )
+
+    def copy_object(
+        self, repo: str, branch: str, dest_path: str, src_ref: str, src_path: str,
+    ) -> lakefs_sdk.ObjectStats:
+        return self._client.objects_api.copy_object(
+            repository=repo, branch=branch, dest_path=dest_path,
+            object_copy_creation=lakefs_sdk.ObjectCopyCreation(
+                src_ref=src_ref, src_path=src_path,
+            ),
+        )
+
+    def diff_branch(
+        self, repo: str, branch: str, after: str = "", amount: int = 100,
+    ) -> lakefs_sdk.DiffList:
+        return self._client.branches_api.diff_branch(
+            repository=repo, branch=branch, after=after, amount=amount,
+        )
+```
+
+### 6.3 Pydantic 数据模型 (`models/`)
+
+定义 API 请求/响应的数据结构：
+
+```python
+# models/dataset.py
+from datetime import datetime
+from pydantic import BaseModel, Field
+
+class DatasetCreate(BaseModel):
+    name: str = Field(..., pattern=r"^[a-z0-9][a-z0-9\-]{2,62}$",
+                      description="数据集唯一标识，只允许小写字母、数字和连字符")
+    display_name: str = Field(..., max_length=255)
+    creator: str
+    description: str = ""
+    storage_namespace: str | None = None
+
+class DatasetUpdate(BaseModel):
+    display_name: str | None = None
+    description: str | None = None
+
+class DatasetResponse(BaseModel):
+    id: str
+    display_name: str
+    creator: str
+    description: str
+    creation_time: datetime
+    last_modified_time: datetime | None = None
+    size_bytes: int = 0
+    file_count: int = 0
+    version_count: int = 0
+    storage_namespace: str
+    default_branch: str = "main"
+
+class DatasetListResponse(BaseModel):
+    results: list[DatasetResponse]
+    has_more: bool = False
+    next_offset: str = ""
+```
+
+```python
+# models/file.py
+from datetime import datetime
+from pydantic import BaseModel
+
+class FileInfo(BaseModel):
+    path: str
+    size_bytes: int
+    checksum: str
+    content_type: str = ""
+    last_modified: datetime | None = None
+    metadata: dict[str, str] = {}
+
+class FileUploadResponse(BaseModel):
+    path: str
+    size_bytes: int
+    checksum: str
+    content_type: str = ""
+    version_id: str
+
+class FileListResponse(BaseModel):
+    results: list[FileInfo]
+    has_more: bool = False
+    next_offset: str = ""
+```
+
+```python
+# models/version.py
+from datetime import datetime
+from pydantic import BaseModel
+
+class VersionInfo(BaseModel):
+    version_id: str
+    message: str
+    operator: str = ""
+    operation: str = ""
+    timestamp: datetime
+    parent_versions: list[str] = []
+
+class DiffEntry(BaseModel):
+    type: str  # "added" | "removed" | "changed"
+    path: str
+    size_bytes: int = 0
+
+class VersionDetail(VersionInfo):
+    changes: list[DiffEntry] = []
+
+class RollbackRequest(BaseModel):
+    strategy: str = "diff_based"  # "diff_based" | "hard_reset"
+    operator: str = ""
+
+class RollbackResponse(BaseModel):
+    new_version_id: str
+    message: str
+    rolled_back_to: str
+    changes: list[DiffEntry] = []
+
+class VersionListResponse(BaseModel):
+    results: list[VersionInfo]
+    has_more: bool = False
+    next_offset: str = ""
+```
+
+```python
+# models/lineage.py
+from datetime import datetime
+from uuid import UUID
+from pydantic import BaseModel
+
+class TaskCreate(BaseModel):
+    name: str
+    description: str = ""
+    task_type: str = ""
+    parent_task_id: UUID | None = None
+    creator: str = ""
+    metadata: dict = {}
+
+class TaskResponse(BaseModel):
+    id: UUID
+    name: str
+    description: str
+    task_type: str
+    parent_task_id: UUID | None
+    creator: str
+    created_at: datetime
+    sub_tasks: list["TaskResponse"] = []
+
+class TaskRunCreate(BaseModel):
+    metadata: dict = {}
+
+class TaskRunResponse(BaseModel):
+    run_id: UUID
+    task_id: UUID
+    status: str  # "running" | "completed" | "failed"
+    started_at: datetime
+    finished_at: datetime | None = None
+
+class LineageEdgeCreate(BaseModel):
+    dataset_id: str
+    dataset_version: str | None = None
+    direction: str  # "input" | "output"
+
+class LineageEdgeBatchCreate(BaseModel):
+    edges: list[LineageEdgeCreate]
+
+class DatasetLineageNode(BaseModel):
+    dataset_id: str
+    dataset_version: str | None = None
+    task_run_id: UUID | None = None
+    task_name: str = ""
+    task_type: str = ""
+
+class DatasetLineageResponse(BaseModel):
+    dataset_id: str
+    upstream: list[DatasetLineageNode] = []
+    downstream: list[DatasetLineageNode] = []
+
+class DAGNode(BaseModel):
+    type: str  # "dataset" | "task"
+    id: str
+    name: str
+
+class DAGEdge(BaseModel):
+    source: str
+    target: str
+    edge_type: str  # "input" | "output"
+
+class DAGResponse(BaseModel):
+    nodes: list[DAGNode]
+    edges: list[DAGEdge]
+```
+
+### 6.4 数据库层 (`db/`)
+
+使用 SQLAlchemy 2.0 + asyncpg 实现 Lineage 数据持久化：
+
+```python
+# db/engine.py
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+from platform_data_service.config import Settings
+
+def create_db_engine(settings: Settings):
+    engine = create_async_engine(settings.database_url, echo=settings.debug, pool_size=10)
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    return engine, session_factory
+```
+
+```python
+# db/tables.py
+import uuid
+from datetime import datetime, timezone
+from sqlalchemy import Column, String, Text, DateTime, ForeignKey, Index, UniqueConstraint
+from sqlalchemy.dialects.postgresql import UUID, JSONB
+from sqlalchemy.orm import DeclarativeBase, relationship
+
+class Base(DeclarativeBase):
+    pass
+
+class LineageTask(Base):
+    __tablename__ = "lineage_tasks"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = Column(String(255), nullable=False)
+    description = Column(Text, default="")
+    task_type = Column(String(50), default="")
+    parent_task_id = Column(UUID(as_uuid=True), ForeignKey("lineage_tasks.id"), nullable=True)
+    creator = Column(String(255), nullable=False, default="")
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc),
+                        onupdate=lambda: datetime.now(timezone.utc))
+    metadata_ = Column("metadata", JSONB, default=dict)
+
+    sub_tasks = relationship("LineageTask", backref="parent_task", remote_side=[id])
+    runs = relationship("LineageTaskRun", back_populates="task")
+
+class LineageTaskRun(Base):
+    __tablename__ = "lineage_task_runs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    task_id = Column(UUID(as_uuid=True), ForeignKey("lineage_tasks.id"), nullable=False)
+    status = Column(String(20), nullable=False, default="running")
+    started_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    finished_at = Column(DateTime(timezone=True), nullable=True)
+    error_message = Column(Text, nullable=True)
+    metadata_ = Column("metadata", JSONB, default=dict)
+
+    task = relationship("LineageTask", back_populates="runs")
+    edges = relationship("LineageEdge", back_populates="task_run")
+
+class LineageEdge(Base):
+    __tablename__ = "lineage_edges"
+    __table_args__ = (
+        UniqueConstraint("task_run_id", "dataset_id", "direction"),
+        Index("idx_lineage_edges_dataset", "dataset_id"),
+    )
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    task_run_id = Column(UUID(as_uuid=True), ForeignKey("lineage_task_runs.id"), nullable=False)
+    dataset_id = Column(String(255), nullable=False)
+    dataset_version = Column(String(255), nullable=True)
+    direction = Column(String(10), nullable=False)  # "input" | "output"
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+    task_run = relationship("LineageTaskRun", back_populates="edges")
+```
+
+```python
+# db/repository.py
+from uuid import UUID
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
+from .tables import LineageTask, LineageTaskRun, LineageEdge
+
+class LineageRepository:
+    """Lineage 数据访问层，所有 SQL 查询集中在此。"""
+
+    def __init__(self, session: AsyncSession):
+        self._session = session
+
+    # ---- Task ----
+
+    async def create_task(self, task: LineageTask) -> LineageTask:
+        self._session.add(task)
+        await self._session.flush()
+        return task
+
+    async def get_task(self, task_id: UUID) -> LineageTask | None:
+        stmt = (
+            select(LineageTask)
+            .options(selectinload(LineageTask.sub_tasks))
+            .where(LineageTask.id == task_id)
+        )
+        result = await self._session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def list_tasks(
+        self, parent_id: UUID | None = None, offset: int = 0, limit: int = 100,
+    ) -> list[LineageTask]:
+        stmt = select(LineageTask).where(LineageTask.parent_task_id == parent_id)
+        stmt = stmt.offset(offset).limit(limit).order_by(LineageTask.created_at.desc())
+        result = await self._session.execute(stmt)
+        return list(result.scalars().all())
+
+    # ---- TaskRun ----
+
+    async def create_task_run(self, run: LineageTaskRun) -> LineageTaskRun:
+        self._session.add(run)
+        await self._session.flush()
+        return run
+
+    async def get_task_run(self, run_id: UUID) -> LineageTaskRun | None:
+        stmt = (
+            select(LineageTaskRun)
+            .options(selectinload(LineageTaskRun.edges), selectinload(LineageTaskRun.task))
+            .where(LineageTaskRun.id == run_id)
+        )
+        result = await self._session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def update_task_run_status(
+        self, run_id: UUID, status: str, error_message: str | None = None,
+    ) -> None:
+        run = await self.get_task_run(run_id)
+        if run:
+            run.status = status
+            if error_message:
+                run.error_message = error_message
+            if status in ("completed", "failed"):
+                from datetime import datetime, timezone
+                run.finished_at = datetime.now(timezone.utc)
+
+    # ---- Edge ----
+
+    async def create_edges(self, edges: list[LineageEdge]) -> list[LineageEdge]:
+        self._session.add_all(edges)
+        await self._session.flush()
+        return edges
+
+    async def get_edges_by_dataset(
+        self, dataset_id: str, direction: str | None = None,
+    ) -> list[LineageEdge]:
+        stmt = (
+            select(LineageEdge)
+            .options(selectinload(LineageEdge.task_run).selectinload(LineageTaskRun.task))
+            .where(LineageEdge.dataset_id == dataset_id)
+        )
+        if direction:
+            stmt = stmt.where(LineageEdge.direction == direction)
+        result = await self._session.execute(stmt)
+        return list(result.scalars().all())
+
+    async def get_edges_by_task_run(self, run_id: UUID) -> list[LineageEdge]:
+        stmt = select(LineageEdge).where(LineageEdge.task_run_id == run_id)
+        result = await self._session.execute(stmt)
+        return list(result.scalars().all())
+```
+
+### 6.5 业务逻辑层 (`services/`)
+
+Service 层是核心业务逻辑所在，封装 lakeFS 操作并实现自动版本管理和 Lineage 追踪。
+
+```python
+# services/dataset_service.py
+from datetime import datetime
+from cachetools import TTLCache
+from platform_data_service.lakefs.client import LakeFSClient
+from platform_data_service.models.dataset import DatasetCreate, DatasetResponse, DatasetUpdate
+
+_size_cache = TTLCache(maxsize=1024, ttl=300)
+
+class DatasetService:
+    METADATA_PREFIX = "platform."
+
+    def __init__(self, lakefs: LakeFSClient):
+        self._lakefs = lakefs
+
+    async def create_dataset(self, req: DatasetCreate, storage_ns_prefix: str) -> DatasetResponse:
+        storage_ns = req.storage_namespace or f"{storage_ns_prefix}/{req.name}"
+        repo = self._lakefs.create_repository(req.name, storage_ns)
+        self._lakefs.set_repository_metadata(req.name, {
+            f"{self.METADATA_PREFIX}display_name": req.display_name,
+            f"{self.METADATA_PREFIX}creator": req.creator,
+            f"{self.METADATA_PREFIX}description": req.description,
+            f"{self.METADATA_PREFIX}managed": "true",
+        })
+        return DatasetResponse(
+            id=repo.id, display_name=req.display_name, creator=req.creator,
+            description=req.description, creation_time=repo.creation_date,
+            storage_namespace=storage_ns, default_branch=repo.default_branch,
+        )
+
+    async def get_dataset(self, dataset_id: str) -> DatasetResponse:
+        repo = self._lakefs.get_repository(dataset_id)
+        metadata = self._lakefs.get_repository_metadata(dataset_id)
+
+        last_modified = repo.creation_date
+        try:
+            commits = self._lakefs.log_commits(dataset_id, repo.default_branch, amount=1)
+            if commits.results:
+                last_modified = commits.results[0].creation_date
+        except Exception:
+            pass
+
+        size_bytes, file_count = await self._get_dataset_size(dataset_id, repo.default_branch)
+
+        return DatasetResponse(
+            id=repo.id,
+            display_name=metadata.get(f"{self.METADATA_PREFIX}display_name", dataset_id),
+            creator=metadata.get(f"{self.METADATA_PREFIX}creator", ""),
+            description=metadata.get(f"{self.METADATA_PREFIX}description", ""),
+            creation_time=repo.creation_date,
+            last_modified_time=last_modified,
+            size_bytes=size_bytes,
+            file_count=file_count,
+            storage_namespace=repo.storage_namespace,
+            default_branch=repo.default_branch,
+        )
+
+    async def update_dataset(self, dataset_id: str, req: DatasetUpdate) -> DatasetResponse:
+        updates = {}
+        if req.display_name is not None:
+            updates[f"{self.METADATA_PREFIX}display_name"] = req.display_name
+        if req.description is not None:
+            updates[f"{self.METADATA_PREFIX}description"] = req.description
+        if updates:
+            self._lakefs.set_repository_metadata(dataset_id, updates)
+        return await self.get_dataset(dataset_id)
+
+    async def delete_dataset(self, dataset_id: str) -> None:
+        self._lakefs.delete_repository(dataset_id)
+        _size_cache.pop(dataset_id, None)
+
+    async def list_datasets(
+        self, prefix: str = "", after: str = "", amount: int = 100,
+    ) -> tuple[list[DatasetResponse], bool, str]:
+        repo_list = self._lakefs.list_repositories(prefix=prefix, after=after, amount=amount)
+        results = []
+        for repo in repo_list.results:
+            try:
+                meta = self._lakefs.get_repository_metadata(repo.id)
+                if meta.get(f"{self.METADATA_PREFIX}managed") != "true":
+                    continue
+            except Exception:
+                continue
+            results.append(DatasetResponse(
+                id=repo.id,
+                display_name=meta.get(f"{self.METADATA_PREFIX}display_name", repo.id),
+                creator=meta.get(f"{self.METADATA_PREFIX}creator", ""),
+                description=meta.get(f"{self.METADATA_PREFIX}description", ""),
+                creation_time=repo.creation_date,
+                storage_namespace=repo.storage_namespace,
+                default_branch=repo.default_branch,
+            ))
+        return results, repo_list.pagination.has_more, repo_list.pagination.next_offset
+
+    async def _get_dataset_size(self, dataset_id: str, branch: str) -> tuple[int, int]:
+        cached = _size_cache.get(dataset_id)
+        if cached:
+            return cached
+        total_size = 0
+        file_count = 0
+        after = ""
+        while True:
+            objs = self._lakefs.list_objects(dataset_id, branch, after=after, amount=1000)
+            for obj in objs.results:
+                total_size += obj.size_bytes
+                file_count += 1
+            if not objs.pagination.has_more:
+                break
+            after = objs.pagination.next_offset
+        _size_cache[dataset_id] = (total_size, file_count)
+        return total_size, file_count
+```
+
+```python
+# services/file_service.py
+from platform_data_service.lakefs.client import LakeFSClient
+from platform_data_service.models.file import FileInfo, FileUploadResponse, FileListResponse
+
+class FileService:
+    def __init__(self, lakefs: LakeFSClient, default_branch: str = "main"):
+        self._lakefs = lakefs
+        self._branch = default_branch
+
+    async def upload_file(
+        self, dataset_id: str, path: str, content: bytes,
+        operator: str = "", task_id: str | None = None,
+    ) -> FileUploadResponse:
+        stats = self._lakefs.upload_object(dataset_id, self._branch, path, content)
+        metadata = {
+            "platform.operation": "add_file",
+            "platform.file_path": path,
+            "platform.operator": operator,
+        }
+        if task_id:
+            metadata["platform.task_id"] = task_id
+        commit = self._lakefs.commit(
+            dataset_id, self._branch,
+            message=f"[add_file] {path}", metadata=metadata,
+        )
+        return FileUploadResponse(
+            path=path, size_bytes=stats.size_bytes,
+            checksum=stats.checksum, content_type=stats.content_type or "",
+            version_id=commit.id,
+        )
+
+    async def upload_files(
+        self, dataset_id: str, files: list[tuple[str, bytes]],
+        operator: str = "", task_id: str | None = None,
+    ) -> list[FileUploadResponse]:
+        results = []
+        for path, content in files:
+            stats = self._lakefs.upload_object(dataset_id, self._branch, path, content)
+            results.append(FileUploadResponse(
+                path=path, size_bytes=stats.size_bytes,
+                checksum=stats.checksum, content_type=stats.content_type or "",
+                version_id="",
+            ))
+        paths = [f[0] for f in files]
+        metadata = {
+            "platform.operation": "batch_add",
+            "platform.file_paths": ",".join(paths),
+            "platform.operator": operator,
+        }
+        if task_id:
+            metadata["platform.task_id"] = task_id
+        commit = self._lakefs.commit(
+            dataset_id, self._branch,
+            message=f"[batch_add] {len(files)} files", metadata=metadata,
+        )
+        for r in results:
+            r.version_id = commit.id
+        return results
+
+    async def delete_file(
+        self, dataset_id: str, path: str, operator: str = "",
+    ) -> str:
+        self._lakefs.delete_object(dataset_id, self._branch, path)
+        commit = self._lakefs.commit(
+            dataset_id, self._branch,
+            message=f"[delete_file] {path}",
+            metadata={
+                "platform.operation": "delete_file",
+                "platform.file_path": path,
+                "platform.operator": operator,
+            },
+        )
+        return commit.id
+
+    async def get_file_content(
+        self, dataset_id: str, path: str, version: str | None = None,
+    ) -> bytes:
+        ref = version or self._branch
+        return self._lakefs.get_object(dataset_id, ref, path)
+
+    async def list_files(
+        self, dataset_id: str, prefix: str = "",
+        after: str = "", amount: int = 100, version: str | None = None,
+    ) -> FileListResponse:
+        ref = version or self._branch
+        objs = self._lakefs.list_objects(
+            dataset_id, ref, prefix=prefix, after=after, amount=amount,
+        )
+        results = [
+            FileInfo(
+                path=obj.path, size_bytes=obj.size_bytes,
+                checksum=obj.checksum, content_type=obj.content_type or "",
+                last_modified=obj.mtime, metadata=obj.metadata or {},
+            )
+            for obj in objs.results
+            if obj.path_type == "object"
+        ]
+        return FileListResponse(
+            results=results,
+            has_more=objs.pagination.has_more,
+            next_offset=objs.pagination.next_offset,
+        )
+```
+
+```python
+# services/version_service.py
+from platform_data_service.lakefs.client import LakeFSClient
+from platform_data_service.models.version import (
+    VersionInfo, VersionDetail, DiffEntry, RollbackResponse, VersionListResponse,
+)
+
+class VersionService:
+    def __init__(self, lakefs: LakeFSClient, default_branch: str = "main"):
+        self._lakefs = lakefs
+        self._branch = default_branch
+
+    async def list_versions(
+        self, dataset_id: str, after: str = "", amount: int = 100,
+    ) -> VersionListResponse:
+        commits = self._lakefs.log_commits(dataset_id, self._branch, after=after, amount=amount)
+        results = [self._commit_to_version_info(c) for c in commits.results]
+        return VersionListResponse(
+            results=results,
+            has_more=commits.pagination.has_more,
+            next_offset=commits.pagination.next_offset,
+        )
+
+    async def get_version_detail(self, dataset_id: str, version_id: str) -> VersionDetail:
+        commit = self._lakefs.get_commit(dataset_id, version_id)
+        info = self._commit_to_version_info(commit)
+        changes = []
+        if commit.parents:
+            parent = commit.parents[0]
+            diffs = self._lakefs.diff_refs(dataset_id, parent, version_id, amount=1000)
+            changes = [
+                DiffEntry(
+                    type=d.type, path=d.path,
+                    size_bytes=d.size_bytes if hasattr(d, "size_bytes") else 0,
+                )
+                for d in diffs.results
+            ]
+        return VersionDetail(**info.model_dump(), changes=changes)
+
+    async def rollback(
+        self, dataset_id: str, target_version: str, operator: str = "",
+    ) -> RollbackResponse:
+        """基于 Diff 的精确回滚：对比当前 HEAD 与目标版本，执行差异操作后 commit。"""
+        after = ""
+        all_diffs = []
+        while True:
+            diffs = self._lakefs.diff_refs(
+                dataset_id, self._branch, target_version, after=after, amount=1000,
+            )
+            all_diffs.extend(diffs.results)
+            if not diffs.pagination.has_more:
+                break
+            after = diffs.pagination.next_offset
+
+        for diff in all_diffs:
+            if diff.type == "removed":
+                self._lakefs.copy_object(
+                    dataset_id, self._branch, diff.path, target_version, diff.path,
+                )
+            elif diff.type == "changed":
+                self._lakefs.copy_object(
+                    dataset_id, self._branch, diff.path, target_version, diff.path,
+                )
+            elif diff.type == "added":
+                self._lakefs.delete_object(dataset_id, self._branch, diff.path)
+
+        commit = self._lakefs.commit(
+            dataset_id, self._branch,
+            message=f"[rollback] Rollback to version {target_version}",
+            metadata={
+                "platform.operation": "rollback",
+                "platform.target_version": target_version,
+                "platform.operator": operator,
+            },
+        )
+        changes = [DiffEntry(type=d.type, path=d.path) for d in all_diffs]
+        return RollbackResponse(
+            new_version_id=commit.id, message=commit.message,
+            rolled_back_to=target_version, changes=changes,
+        )
+
+    @staticmethod
+    def _commit_to_version_info(commit) -> VersionInfo:
+        meta = commit.metadata or {}
+        return VersionInfo(
+            version_id=commit.id, message=commit.message,
+            operator=meta.get("platform.operator", commit.committer or ""),
+            operation=meta.get("platform.operation", ""),
+            timestamp=commit.creation_date,
+            parent_versions=list(commit.parents) if commit.parents else [],
+        )
+```
+
+```python
+# services/lineage_service.py
+from uuid import UUID
+from collections import deque
+from sqlalchemy.ext.asyncio import AsyncSession
+from platform_data_service.db.repository import LineageRepository
+from platform_data_service.db.tables import LineageTask, LineageTaskRun, LineageEdge
+from platform_data_service.models.lineage import (
+    TaskCreate, TaskResponse, TaskRunCreate, TaskRunResponse,
+    LineageEdgeCreate, DatasetLineageResponse, DatasetLineageNode,
+    DAGNode, DAGEdge, DAGResponse,
+)
+
+class LineageService:
+    def __init__(self, session: AsyncSession):
+        self._repo = LineageRepository(session)
+        self._session = session
+
+    async def create_task(self, req: TaskCreate) -> TaskResponse:
+        task = LineageTask(
+            name=req.name, description=req.description, task_type=req.task_type,
+            parent_task_id=req.parent_task_id, creator=req.creator, metadata_=req.metadata,
+        )
+        task = await self._repo.create_task(task)
+        await self._session.commit()
+        return self._task_to_response(task)
+
+    async def get_task(self, task_id: UUID) -> TaskResponse | None:
+        task = await self._repo.get_task(task_id)
+        return self._task_to_response(task) if task else None
+
+    async def start_run(self, task_id: UUID, req: TaskRunCreate) -> TaskRunResponse:
+        run = LineageTaskRun(task_id=task_id, metadata_=req.metadata)
+        run = await self._repo.create_task_run(run)
+        await self._session.commit()
+        return TaskRunResponse(
+            run_id=run.id, task_id=run.task_id,
+            status=run.status, started_at=run.started_at,
+        )
+
+    async def finish_run(
+        self, run_id: UUID, status: str, error_message: str | None = None,
+    ) -> None:
+        await self._repo.update_task_run_status(run_id, status, error_message)
+        await self._session.commit()
+
+    async def add_edges(self, run_id: UUID, edges: list[LineageEdgeCreate]) -> None:
+        db_edges = [
+            LineageEdge(
+                task_run_id=run_id, dataset_id=e.dataset_id,
+                dataset_version=e.dataset_version, direction=e.direction,
+            )
+            for e in edges
+        ]
+        await self._repo.create_edges(db_edges)
+        await self._session.commit()
+
+    async def get_dataset_lineage(
+        self, dataset_id: str, depth: int = 3,
+    ) -> DatasetLineageResponse:
+        upstream = await self._traverse(dataset_id, "output", depth)
+        downstream = await self._traverse(dataset_id, "input", depth)
+        return DatasetLineageResponse(
+            dataset_id=dataset_id, upstream=upstream, downstream=downstream,
+        )
+
+    async def get_dag(
+        self, root_dataset_id: str, depth: int = 5,
+    ) -> DAGResponse:
+        """BFS 遍历构建 DAG 图。"""
+        nodes: dict[str, DAGNode] = {}
+        edges: list[DAGEdge] = []
+        visited: set[str] = set()
+        queue: deque[tuple[str, int]] = deque([(root_dataset_id, 0)])
+
+        while queue:
+            dataset_id, current_depth = queue.popleft()
+            if dataset_id in visited or current_depth > depth:
+                continue
+            visited.add(dataset_id)
+            nodes[f"ds:{dataset_id}"] = DAGNode(type="dataset", id=dataset_id, name=dataset_id)
+
+            for direction in ("input", "output"):
+                db_edges = await self._repo.get_edges_by_dataset(dataset_id, direction)
+                for edge in db_edges:
+                    task = edge.task_run.task
+                    task_key = f"task:{task.id}"
+                    nodes[task_key] = DAGNode(type="task", id=str(task.id), name=task.name)
+
+                    if direction == "output":
+                        edges.append(DAGEdge(
+                            source=task_key, target=f"ds:{dataset_id}", edge_type="output",
+                        ))
+                        input_edges = await self._repo.get_edges_by_task_run(edge.task_run_id)
+                        for ie in input_edges:
+                            if ie.direction == "input" and ie.dataset_id not in visited:
+                                queue.append((ie.dataset_id, current_depth + 1))
+                                edges.append(DAGEdge(
+                                    source=f"ds:{ie.dataset_id}", target=task_key,
+                                    edge_type="input",
+                                ))
+                    elif direction == "input":
+                        edges.append(DAGEdge(
+                            source=f"ds:{dataset_id}", target=task_key, edge_type="input",
+                        ))
+                        output_edges = await self._repo.get_edges_by_task_run(edge.task_run_id)
+                        for oe in output_edges:
+                            if oe.direction == "output" and oe.dataset_id not in visited:
+                                queue.append((oe.dataset_id, current_depth + 1))
+                                edges.append(DAGEdge(
+                                    source=task_key, target=f"ds:{oe.dataset_id}",
+                                    edge_type="output",
+                                ))
+
+        return DAGResponse(nodes=list(nodes.values()), edges=edges)
+
+    async def _traverse(
+        self, dataset_id: str, direction: str, depth: int,
+    ) -> list[DatasetLineageNode]:
+        """沿指定方向遍历血缘关系。direction='output' 表示查上游，'input' 表示查下游。"""
+        results = []
+        db_edges = await self._repo.get_edges_by_dataset(dataset_id, direction)
+        for edge in db_edges:
+            task = edge.task_run.task
+            opposite = "input" if direction == "output" else "output"
+            related_edges = await self._repo.get_edges_by_task_run(edge.task_run_id)
+            for re in related_edges:
+                if re.direction == opposite:
+                    results.append(DatasetLineageNode(
+                        dataset_id=re.dataset_id, dataset_version=re.dataset_version,
+                        task_run_id=edge.task_run_id, task_name=task.name,
+                        task_type=task.task_type,
+                    ))
+        return results
+
+    @staticmethod
+    def _task_to_response(task: LineageTask) -> TaskResponse:
+        sub_tasks = [
+            TaskResponse(
+                id=st.id, name=st.name, description=st.description or "",
+                task_type=st.task_type or "", parent_task_id=st.parent_task_id,
+                creator=st.creator or "", created_at=st.created_at,
+            )
+            for st in (task.sub_tasks or [])
+        ]
+        return TaskResponse(
+            id=task.id, name=task.name, description=task.description or "",
+            task_type=task.task_type or "", parent_task_id=task.parent_task_id,
+            creator=task.creator or "", created_at=task.created_at, sub_tasks=sub_tasks,
+        )
+```
+
+### 6.6 FastAPI 路由层 (`routers/`)
+
+```python
+# routers/datasets.py
+from fastapi import APIRouter, Depends, HTTPException
+from platform_data_service.dependencies import get_dataset_service
+from platform_data_service.models.dataset import (
+    DatasetCreate, DatasetResponse, DatasetUpdate, DatasetListResponse,
+)
+from platform_data_service.services.dataset_service import DatasetService
+
+router = APIRouter(prefix="/api/v1/datasets", tags=["datasets"])
+
+@router.post("", response_model=DatasetResponse, status_code=201)
+async def create_dataset(
+    req: DatasetCreate, svc: DatasetService = Depends(get_dataset_service),
+):
+    return await svc.create_dataset(req, storage_ns_prefix="s3://platform-data")
+
+@router.get("", response_model=DatasetListResponse)
+async def list_datasets(
+    prefix: str = "", after: str = "", amount: int = 100,
+    svc: DatasetService = Depends(get_dataset_service),
+):
+    results, has_more, next_offset = await svc.list_datasets(prefix, after, amount)
+    return DatasetListResponse(results=results, has_more=has_more, next_offset=next_offset)
+
+@router.get("/{dataset_id}", response_model=DatasetResponse)
+async def get_dataset(
+    dataset_id: str, svc: DatasetService = Depends(get_dataset_service),
+):
+    return await svc.get_dataset(dataset_id)
+
+@router.patch("/{dataset_id}", response_model=DatasetResponse)
+async def update_dataset(
+    dataset_id: str, req: DatasetUpdate,
+    svc: DatasetService = Depends(get_dataset_service),
+):
+    return await svc.update_dataset(dataset_id, req)
+
+@router.delete("/{dataset_id}", status_code=204)
+async def delete_dataset(
+    dataset_id: str, svc: DatasetService = Depends(get_dataset_service),
+):
+    await svc.delete_dataset(dataset_id)
+```
+
+```python
+# routers/files.py
+from fastapi import APIRouter, Depends, UploadFile, File, Query
+from fastapi.responses import StreamingResponse
+from platform_data_service.dependencies import get_file_service
+from platform_data_service.models.file import FileUploadResponse, FileListResponse
+from platform_data_service.services.file_service import FileService
+import io
+
+router = APIRouter(prefix="/api/v1/datasets/{dataset_id}/files", tags=["files"])
+
+@router.post("", response_model=FileUploadResponse, status_code=201)
+async def upload_file(
+    dataset_id: str, path: str = Query(...), file: UploadFile = File(...),
+    operator: str = Query(""), svc: FileService = Depends(get_file_service),
+):
+    content = await file.read()
+    return await svc.upload_file(dataset_id, path, content, operator)
+
+@router.get("", response_model=FileListResponse)
+async def list_files(
+    dataset_id: str, prefix: str = "", after: str = "",
+    amount: int = 100, version: str | None = None,
+    svc: FileService = Depends(get_file_service),
+):
+    return await svc.list_files(dataset_id, prefix, after, amount, version)
+
+@router.get("/content")
+async def download_file(
+    dataset_id: str, path: str = Query(...), version: str | None = None,
+    svc: FileService = Depends(get_file_service),
+):
+    content = await svc.get_file_content(dataset_id, path, version)
+    return StreamingResponse(io.BytesIO(content), media_type="application/octet-stream")
+
+@router.delete("")
+async def delete_file(
+    dataset_id: str, path: str = Query(...), operator: str = Query(""),
+    svc: FileService = Depends(get_file_service),
+):
+    version_id = await svc.delete_file(dataset_id, path, operator)
+    return {"version_id": version_id}
+```
+
+```python
+# routers/versions.py
+from fastapi import APIRouter, Depends
+from platform_data_service.dependencies import get_version_service
+from platform_data_service.models.version import (
+    VersionDetail, RollbackRequest, RollbackResponse, VersionListResponse,
+)
+from platform_data_service.services.version_service import VersionService
+
+router = APIRouter(prefix="/api/v1/datasets/{dataset_id}/versions", tags=["versions"])
+
+@router.get("", response_model=VersionListResponse)
+async def list_versions(
+    dataset_id: str, after: str = "", amount: int = 100,
+    svc: VersionService = Depends(get_version_service),
+):
+    return await svc.list_versions(dataset_id, after, amount)
+
+@router.get("/{version_id}", response_model=VersionDetail)
+async def get_version(
+    dataset_id: str, version_id: str,
+    svc: VersionService = Depends(get_version_service),
+):
+    return await svc.get_version_detail(dataset_id, version_id)
+
+@router.post("/{version_id}/rollback", response_model=RollbackResponse)
+async def rollback(
+    dataset_id: str, version_id: str, req: RollbackRequest,
+    svc: VersionService = Depends(get_version_service),
+):
+    return await svc.rollback(dataset_id, version_id, req.operator)
+```
+
+```python
+# routers/lineage.py
+from uuid import UUID
+from fastapi import APIRouter, Depends
+from platform_data_service.dependencies import get_lineage_service
+from platform_data_service.models.lineage import (
+    TaskCreate, TaskResponse, TaskRunCreate, TaskRunResponse,
+    LineageEdgeBatchCreate, DatasetLineageResponse, DAGResponse,
+)
+from platform_data_service.services.lineage_service import LineageService
+
+router = APIRouter(prefix="/api/v1/lineage", tags=["lineage"])
+
+@router.post("/tasks", response_model=TaskResponse, status_code=201)
+async def create_task(
+    req: TaskCreate, svc: LineageService = Depends(get_lineage_service),
+):
+    return await svc.create_task(req)
+
+@router.get("/tasks/{task_id}", response_model=TaskResponse)
+async def get_task(
+    task_id: UUID, svc: LineageService = Depends(get_lineage_service),
+):
+    result = await svc.get_task(task_id)
+    if not result:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Task not found")
+    return result
+
+@router.post("/tasks/{task_id}/runs", response_model=TaskRunResponse, status_code=201)
+async def start_run(
+    task_id: UUID, req: TaskRunCreate,
+    svc: LineageService = Depends(get_lineage_service),
+):
+    return await svc.start_run(task_id, req)
+
+@router.patch("/runs/{run_id}")
+async def update_run(
+    run_id: UUID, status: str, error_message: str | None = None,
+    svc: LineageService = Depends(get_lineage_service),
+):
+    await svc.finish_run(run_id, status, error_message)
+    return {"status": "ok"}
+
+@router.post("/runs/{run_id}/edges", status_code=201)
+async def add_edges(
+    run_id: UUID, req: LineageEdgeBatchCreate,
+    svc: LineageService = Depends(get_lineage_service),
+):
+    await svc.add_edges(run_id, req.edges)
+    return {"status": "ok"}
+
+@router.get("/datasets/{dataset_id}", response_model=DatasetLineageResponse)
+async def get_dataset_lineage(
+    dataset_id: str, depth: int = 3,
+    svc: LineageService = Depends(get_lineage_service),
+):
+    return await svc.get_dataset_lineage(dataset_id, depth)
+
+@router.get("/dag", response_model=DAGResponse)
+async def get_dag(
+    root_dataset_id: str, depth: int = 5,
+    svc: LineageService = Depends(get_lineage_service),
+):
+    return await svc.get_dag(root_dataset_id, depth)
+```
+
+### 6.7 依赖注入 (`dependencies.py`)
+
+```python
+# dependencies.py
+from fastapi import Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+from platform_data_service.config import Settings
+from platform_data_service.db.engine import create_db_engine
+from platform_data_service.lakefs.client import LakeFSClient
+from platform_data_service.services.dataset_service import DatasetService
+from platform_data_service.services.file_service import FileService
+from platform_data_service.services.version_service import VersionService
+from platform_data_service.services.lineage_service import LineageService
+
+_settings: Settings | None = None
+_lakefs_client: LakeFSClient | None = None
+_session_factory = None
+
+def get_settings() -> Settings:
+    global _settings
+    if _settings is None:
+        _settings = Settings()
+    return _settings
+
+def get_lakefs_client(settings: Settings = Depends(get_settings)) -> LakeFSClient:
+    global _lakefs_client
+    if _lakefs_client is None:
+        _lakefs_client = LakeFSClient(
+            endpoint=settings.lakefs_endpoint,
+            access_key=settings.lakefs_access_key,
+            secret_key=settings.lakefs_secret_key,
+        )
+    return _lakefs_client
+
+async def get_db_session(settings: Settings = Depends(get_settings)) -> AsyncSession:
+    global _session_factory
+    if _session_factory is None:
+        _, _session_factory = create_db_engine(settings)
+    async with _session_factory() as session:
+        yield session
+
+def get_dataset_service(
+    lakefs: LakeFSClient = Depends(get_lakefs_client),
+) -> DatasetService:
+    return DatasetService(lakefs)
+
+def get_file_service(
+    lakefs: LakeFSClient = Depends(get_lakefs_client),
+    settings: Settings = Depends(get_settings),
+) -> FileService:
+    return FileService(lakefs, settings.lakefs_default_branch)
+
+def get_version_service(
+    lakefs: LakeFSClient = Depends(get_lakefs_client),
+    settings: Settings = Depends(get_settings),
+) -> VersionService:
+    return VersionService(lakefs, settings.lakefs_default_branch)
+
+async def get_lineage_service(
+    session: AsyncSession = Depends(get_db_session),
+) -> LineageService:
+    return LineageService(session)
+```
+
+### 6.8 应用入口 (`main.py`)
+
+```python
+# main.py
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from platform_data_service.config import Settings
+from platform_data_service.db.engine import create_db_engine
+from platform_data_service.routers import datasets, files, versions, lineage
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    settings = Settings()
+    engine, _ = create_db_engine(settings)
+    yield
+    await engine.dispose()
+
+def create_app() -> FastAPI:
+    app = FastAPI(
+        title="Platform Data Service",
+        description="数据集管理与版本控制平台，基于 lakeFS 构建",
+        version="1.0.0",
+        lifespan=lifespan,
+    )
+    app.include_router(datasets.router)
+    app.include_router(files.router)
+    app.include_router(versions.router)
+    app.include_router(lineage.router)
+    return app
+
+app = create_app()
+```
+
+### 6.9 Docker Compose 开发环境
+
+```yaml
+# docker-compose.yml
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
+
+  minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - miniodata:/data
+
+  lakefs:
+    image: treeverse/lakefs:latest
+    depends_on:
+      - postgres
+      - minio
+    ports:
+      - "8000:8000"
+    environment:
+      LAKEFS_DATABASE_TYPE: postgres
+      LAKEFS_DATABASE_POSTGRES_CONNECTION_STRING: postgres://postgres:postgres@postgres:5432/lakefs?sslmode=disable
+      LAKEFS_AUTH_ENCRYPT_SECRET_KEY: "some-secret-key-at-least-16-ch"
+      LAKEFS_BLOCKSTORE_TYPE: s3
+      LAKEFS_BLOCKSTORE_S3_ENDPOINT: http://minio:9000
+      LAKEFS_BLOCKSTORE_S3_FORCE_PATH_STYLE: "true"
+      LAKEFS_BLOCKSTORE_S3_CREDENTIALS_ACCESS_KEY_ID: minioadmin
+      LAKEFS_BLOCKSTORE_S3_CREDENTIALS_SECRET_ACCESS_KEY: minioadmin
+
+  platform-service:
+    build: .
+    depends_on:
+      - lakefs
+      - postgres
+    ports:
+      - "8080:8080"
+    environment:
+      PLATFORM_LAKEFS_ENDPOINT: http://lakefs:8000/api/v1
+      PLATFORM_LAKEFS_ACCESS_KEY: ${LAKEFS_ACCESS_KEY}
+      PLATFORM_LAKEFS_SECRET_KEY: ${LAKEFS_SECRET_KEY}
+      PLATFORM_DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/platform_lineage
+      PLATFORM_LAKEFS_STORAGE_NAMESPACE_PREFIX: s3://platform-data
+
+volumes:
+  pgdata:
+  miniodata:
+```
+
+### 6.10 pyproject.toml
+
+```toml
+# pyproject.toml
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "platform-data-service"
+version = "1.0.0"
+description = "数据集管理与版本控制平台服务"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "lakefs-sdk>=1.0",
+    "sqlalchemy[asyncio]>=2.0",
+    "asyncpg>=0.29",
+    "alembic>=1.13",
+    "pydantic-settings>=2.0",
+    "httpx>=0.27",
+    "cachetools>=5.3",
+    "apscheduler>=3.10",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=4.0",
+    "ruff>=0.3",
+    "mypy>=1.8",
+    "httpx",  # for TestClient
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+```
+
+## 7. Python SDK 设计
+
+独立发布的 Python SDK 包，供用户在脚本和 Notebook 中使用：
 
 ```python
 from platform_data_sdk import PlatformClient
 
-client = PlatformClient(endpoint="http://platform-service:8080", token="xxx")
+client = PlatformClient(endpoint="http://platform-service:8080")
 
 # ---- 数据集操作 ----
 dataset = client.create_dataset(
     name="training-images",
     display_name="训练图像集",
-    description="用于目标检测模型的训练图像"
+    description="用于目标检测模型的训练图像",
 )
 
 datasets = client.list_datasets(prefix="training")
@@ -1046,13 +2486,13 @@ client.rollback("training-images", target_version="commit-sha-xxx")
 task = client.create_task(
     name="preprocess-pipeline",
     task_type="preprocessing",
-    description="图像预处理流水线"
+    description="图像预处理流水线",
 )
 
 sub_task = client.create_task(
     name="resize-step",
     task_type="preprocessing",
-    parent_task_id=task.id
+    parent_task_id=task.id,
 )
 
 run = client.start_task_run(task.id)
@@ -1075,9 +2515,9 @@ print(lineage.downstream)
 dag = client.get_lineage_dag(root_dataset="final-model", depth=5)
 ```
 
-## 7. 一期交付范围与排期
+## 8. 一期交付范围与排期
 
-### 7.1 里程碑规划
+### 8.1 里程碑规划
 
 | 阶段 | 时间 | 交付内容 |
 |------|------|---------|
@@ -1086,40 +2526,40 @@ dag = client.get_lineage_dag(root_dataset="final-model", depth=5)
 | M3: Data Lineage | 3月22日 - 3月28日 | Lineage 数据模型、任务管理 API、血缘查询 API (R7) |
 | M4: 集成测试 | 3月29日 - 3月31日 | 端到端测试、文档完善、Bug 修复 |
 
-### 7.2 一期详细任务分解
+### 8.2 一期详细任务分解
 
-**M1: 核心功能（2周）**
-- [ ] 搭建 Platform Service 项目骨架
-- [ ] 实现 lakeFS 客户端封装
-- [ ] 实现数据集 CRUD API
-- [ ] 实现文件上传/下载/删除/更新 API
-- [ ] 实现文件列表查询 API
-- [ ] 实现自动 commit 机制
-- [ ] 单元测试
+**M1: 项目搭建与核心功能（2周）**
+- [ ] 初始化 Python 项目骨架（pyproject.toml、src layout、docker-compose）
+- [ ] 实现 `config.py`（pydantic-settings 配置管理）
+- [ ] 实现 `lakefs/client.py`（lakefs-sdk 封装层）
+- [ ] 实现 `db/` 层（SQLAlchemy tables、engine、Alembic migration）
+- [ ] 实现 `services/dataset_service.py` + `routers/datasets.py`（数据集 CRUD）
+- [ ] 实现 `services/file_service.py` + `routers/files.py`（文件上传/下载/删除/更新/列表）
+- [ ] 实现自动 commit 机制（文件操作后自动生成版本）
+- [ ] 实现 `dependencies.py`（FastAPI 依赖注入）
+- [ ] 单元测试 (pytest + mock lakeFS)
 
-**M2: 版本管理（1周）**
-- [ ] 实现版本列表 API
-- [ ] 实现版本详情 API（含 diff）
-- [ ] 实现版本回滚 API
-- [ ] Python SDK 基础版（数据集、文件、版本操作）
-- [ ] 集成测试
+**M2: 版本管理与 SDK（1周）**
+- [ ] 实现 `services/version_service.py` + `routers/versions.py`（版本列表、详情、回滚）
+- [ ] 实现 Diff-based 回滚策略
+- [ ] 开发 `sdk/` Python SDK 包（PlatformClient，覆盖数据集/文件/版本操作）
+- [ ] 集成测试（FastAPI TestClient + 真实 lakeFS）
 
 **M3: Data Lineage（1周）**
-- [ ] Lineage 数据库 migration
-- [ ] 实现任务 CRUD API
-- [ ] 实现任务执行管理 API
-- [ ] 实现血缘边记录 API
-- [ ] 实现血缘查询 API（上下游、DAG）
-- [ ] Python SDK Lineage 部分
-- [ ] lakeFS Hook 集成
+- [ ] Alembic migration: 创建 lineage_tasks / lineage_task_runs / lineage_edges 表
+- [ ] 实现 `db/repository.py`（Lineage 数据访问层）
+- [ ] 实现 `services/lineage_service.py`（任务管理、血缘记录、DAG BFS 查询）
+- [ ] 实现 `routers/lineage.py`（Lineage API 路由）
+- [ ] Python SDK 增加 Lineage 部分
+- [ ] 血缘与 lakeFS commit metadata 联动
 
 **M4: 集成测试与收尾（3天）**
-- [ ] 端到端测试场景覆盖
-- [ ] API 文档最终版
-- [ ] 部署文档
+- [ ] 端到端测试场景覆盖（docker-compose up 一键测试）
+- [ ] FastAPI 自动生成 OpenAPI 文档校验
+- [ ] Dockerfile 优化 & 部署文档
 - [ ] Bug 修复与性能优化
 
-## 8. 风险与应对
+## 9. 风险与应对
 
 | 风险 | 影响 | 应对策略 |
 |------|------|---------|
@@ -1129,7 +2569,7 @@ dag = client.get_lineage_dag(root_dataset="final-model", depth=5)
 | Lineage 数据一致性 | 血缘记录不完整 | 利用 lakeFS Hook 自动记录；SDK 封装确保操作原子性 |
 | 开发周期紧张 | 功能不全 | Lineage 可适当简化，先实现核心 CRUD 和查询，DAG 可视化后续迭代 |
 
-## 9. 后续演进（二期规划）
+## 10. 后续演进（二期规划）
 
 - **数据集权限管理**：基于 lakeFS RBAC，实现数据集级别的读写权限控制
 - **数据集分支**：利用 lakeFS branch 支持数据集的多版本并行开发和合并
